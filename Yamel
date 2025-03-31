@@ -1,0 +1,32 @@
+name: Deploy issue, please ensure that the following secrets are correctly configured in your repository's settings:
+
+ SEO Bot
+
+on:
+  push:
+    branches: [ main ]
+
+1. **DOCKER_HUB_USERNAME**: Your Docker Hub username.
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps2. **DOCKER_HUB_TOKEN**: A Docker Hub access token or password:
+      - uses: actions.
+
+Here's how the relevant section of your workflow/checkout@v2
+      
+      - name: Set up Docker
+        uses: docker/setup-buildx file looks:
+
+```yaml
+- name: Login to Docker Hub-action@v1
+      
+      - name: Login to Docker Hub
+
+  uses: docker/login-action@v1
+  with:
+    username:        uses: docker/login-action@v1
+        with:
+ ${{ secrets.DOCKER_HUB_USERNAME }}
+    password: ${{          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+ secrets.DOCKER_HUB_TOKEN }}
