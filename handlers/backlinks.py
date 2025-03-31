@@ -1,9 +1,9 @@
-
 # handlers/backlinks.py - مدیریت تحلیل بک‌لینک‌ها
 
 import logging
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
+import re
 
 from telegram import (
     Update,
@@ -26,11 +26,25 @@ from services.seo_tools import BacklinkAnalyzer
 from utils.decorators import restricted
 from utils.helpers import format_number, truncate_text
 from utils.logger import logger
+from utils.cache import cache
 
 class BacklinkHandler:
     def __init__(self):
         self.analyzer = BacklinkAnalyzer(api_key=settings.MOZ_API_KEY)
         self.MAX_RESULTS = 50
+        self.RATE_LIMIT = timedelta(minutes=1)  # محدودیت نرخ: 1 درخواست در دقیقه
+        self.last_requests = {}  # برای پیگیری آخرین درخواست‌های کاربران
+
+    def _check_rate_limit(self, user_id: int) -> bool:
+        """بررسی محدودیت نرخ برای کاربر"""
+        now = datetime.now()
+        last_request = self.last_requests.get(user_id)
+        
+        if last_request and (now - last_request) < self.RATE_LIMIT:
+            return False
+            
+        self.last_requests[user_id] = now
+        return True
 
     @restricted()
     def backlink_menu(self, update: Update, context: CallbackContext) -> None:
@@ -50,7 +64,8 @@ class BacklinkHandler:
 
             update.message.reply_text(
                 text="🔄 لطفا نوع تحلیل بک‌لینک را انتخاب کنید:",
-                reply_markup=InlineKeyboardMarkup(buttons)
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN
             )
 
         except Exception as e:
@@ -73,6 +88,14 @@ class BacklinkHandler:
                 self.request_compare_input(query, context)
             elif action == "bl_saved":
                 self.show_saved_reports(query)
+            elif action.startswith("view_saved:"):
+                self.view_saved_report(query)
+            elif action.startswith("download_report:"):
+                self.download_report(query)
+            elif action.startswith("save_"):
+                self.save_report(query)
+            elif action.startswith("compare_chart:"):
+                self.show_comparison_chart(query)
             elif action == "back":
                 self.return_to_main_menu(query)
 
@@ -87,7 +110,8 @@ class BacklinkHandler:
             
             query.edit_message_text(
                 text="🌐 لطفا دامنه مورد نظر را بدون https:// وارد کنید:\nمثال: example.com",
-                reply_markup=InlineKeyboardMarkup([[get_back_button("لغو")]])
+                reply_markup=InlineKeyboardMarkup([[get_back_button("لغو")]]),
+                parse_mode=ParseMode.MARKDOWN
             )
 
         except Exception as e:
@@ -101,7 +125,8 @@ class BacklinkHandler:
             
             query.edit_message_text(
                 text="📋 لطفا دامنه مورد نظر برای گزارش کامل را وارد کنید:",
-                reply_markup=InlineKeyboardMarkup([[get_back_button("لغو")]])
+                reply_markup=InlineKeyboardMarkup([[get_back_button("لغو")]]),
+                parse_mode=ParseMode.MARKDOWN
             )
 
         except Exception as e:
@@ -117,7 +142,8 @@ class BacklinkHandler:
             
             query.edit_message_text(
                 text="🔢 لطفا دامنه اول را برای مقایسه وارد کنید:",
-                reply_markup=InlineKeyboardMarkup([[get_back_button("لغو")]])
+                reply_markup=InlineKeyboardMarkup([[get_back_button("لغو")]]),
+                parse_mode=ParseMode.MARKDOWN
             )
 
         except Exception as e:
@@ -127,6 +153,13 @@ class BacklinkHandler:
     def process_domain_input(self, update: Update, context: CallbackContext) -> None:
         """پردازش دامنه وارد شده"""
         try:
+            user_id = update.effective_user.id
+            
+            # بررسی محدودیت نرخ
+            if not self._check_rate_limit(user_id):
+                update.message.reply_text("⏳ لطفاً برای جلوگیری از overload، 1 دقیقه صبر کنید.")
+                return
+
             domain = update.message.text.strip().lower()
             
             if not self.validate_domain(domain):
@@ -156,16 +189,24 @@ class BacklinkHandler:
         # حذف پروتکل و مسیرها در صورت وجود
         domain = domain.replace('https://', '').replace('http://', '').split('/')[0]
         
-        # بررسی وجود حداقل یک نقطه و کاراکترهای مجاز
-        return '.' in domain and all(c.isalnum() or c in ['.', '-'] for c in domain)
+        # الگوی regex برای دامنه‌های معتبر (شامل دامنه‌های بین‌المللی)
+        pattern = r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
+        
+        return bool(re.fullmatch(pattern, domain))
 
     def analyze_domain(self, update: Update, context: CallbackContext, domain: str) -> None:
         """تحلیل اولیه دامنه"""
         try:
             update.message.reply_text(f"🔍 در حال تحلیل دامنه {domain}...")
             
-            # دریافت داده‌های اولیه
-            summary = self.analyzer.get_domain_summary(domain)
+            # بررسی کش قبل از درخواست به API
+            cache_key = f"domain_summary:{domain}"
+            summary = cache.get(cache_key)
+            
+            if summary is None:
+                summary = self.analyzer.get_domain_summary(domain)
+                if summary:
+                    cache.set(cache_key, summary, timeout=3600)  # کش برای 1 ساعت
             
             if not summary:
                 update.message.reply_text("⚠️ اطلاعاتی برای این دامنه یافت نشد.")
@@ -209,8 +250,14 @@ class BacklinkHandler:
         try:
             update.message.reply_text(f"⏳ در حال تهیه گزارش کامل برای {domain}...")
             
-            # دریافت گزارش کامل
-            report = self.analyzer.get_full_report(domain)
+            # بررسی کش قبل از درخواست به API
+            cache_key = f"full_report:{domain}"
+            report = cache.get(cache_key)
+            
+            if report is None:
+                report = self.analyzer.get_full_report(domain)
+                if report:
+                    cache.set(cache_key, report, timeout=86400)  # کش برای 24 ساعت
             
             if not report:
                 update.message.reply_text("⚠️ اطلاعاتی برای این دامنه یافت نشد.")
@@ -288,7 +335,8 @@ class BacklinkHandler:
 
             update.message.reply_text(
                 text="برای دریافت گزارش کامل به صورت فایل یا ذخیره گزارش از دکمه‌های زیر استفاده کنید:",
-                reply_markup=InlineKeyboardMarkup(buttons)
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN
             )
 
         except Exception as e:
@@ -308,7 +356,8 @@ class BacklinkHandler:
                 context.user_data['compare_step'] = 2
                 update.message.reply_text(
                     text="🔢 لطفا دامنه دوم را برای مقایسه وارد کنید:",
-                    reply_markup=InlineKeyboardMarkup([[get_back_button("لغو")]])
+                    reply_markup=InlineKeyboardMarkup([[get_back_button("لغو")]]),
+                    parse_mode=ParseMode.MARKDOWN
                 )
             else:
                 self.compare_domains(update, context, domains)
@@ -326,8 +375,14 @@ class BacklinkHandler:
 
             update.message.reply_text(f"⚖️ در حال مقایسه {domains[0]} و {domains[1]}...")
             
-            # دریافت داده‌های مقایسه
-            comparison = self.analyzer.compare_domains(domains[0], domains[1])
+            # بررسی کش قبل از درخواست به API
+            cache_key = f"compare:{domains[0]}:{domains[1]}"
+            comparison = cache.get(cache_key)
+            
+            if comparison is None:
+                comparison = self.analyzer.compare_domains(domains[0], domains[1])
+                if comparison:
+                    cache.set(cache_key, comparison, timeout=3600)  # کش برای 1 ساعت
             
             if not comparison:
                 update.message.reply_text("⚠️ خطایی در مقایسه دامنه‌ها رخ داد.")
@@ -339,7 +394,7 @@ class BacklinkHandler:
                 "\n🔗 *بک‌لینک‌ها:*",
                 f"{domains[0]}: {format_number(comparison.get('domain1', {}).get('backlinks', 0))}",
                 f"{domains[1]}: {format_number(comparison.get('domain2', {}).get('backlinks', 0))}",
-                f"تفاوت: {format_number(abs(comparison.get('backlinks_diff', 0))}",
+                f"تفاوت: {format_number(abs(comparison.get('backlinks_diff', 0)))}",
                 
                 "\n🌐 *دامنه‌های ارجاع دهنده:*",
                 f"{domains[0]}: {format_number(comparison.get('domain1', {}).get('referring_domains', 0))}",
@@ -401,12 +456,101 @@ class BacklinkHandler:
 
             query.edit_message_text(
                 text="📂 گزارشات ذخیره شده شما:",
-                reply_markup=InlineKeyboardMarkup(buttons)
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN
             )
 
         except Exception as e:
             logger.error(f"Error showing saved reports: {str(e)}", exc_info=True)
             query.edit_message_text("⚠️ خطایی در دریافت گزارشات ذخیره شده رخ داد.")
+
+    def view_saved_report(self, query) -> None:
+        """نمایش گزارش ذخیره شده"""
+        try:
+            report_id = query.data.split(":")[1]
+            report = db.get_saved_report(report_id)
+            
+            if not report:
+                query.edit_message_text("⚠️ گزارش مورد نظر یافت نشد.")
+                return
+
+            text = [
+                f"📌 *گزارش ذخیره شده برای {report.get('domain', 'نامعلوم')}*",
+                f"📅 تاریخ ذخیره: {report.get('saved_at', 'نامعلوم')}",
+                "\nبرای مشاهده جزئیات بیشتر از گزینه‌های زیر استفاده کنید:"
+            ]
+
+            buttons = [
+                [InlineKeyboardButton("📤 دریافت فایل", callback_data=f"download_saved:{report_id}")],
+                [InlineKeyboardButton("🗑 حذف گزارش", callback_data=f"delete_report:{report_id}")],
+                [get_back_button("بازگشت به لیست")]
+            ]
+
+            query.edit_message_text(
+                text="\n".join(text),
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        except Exception as e:
+            logger.error(f"Error viewing saved report: {str(e)}", exc_info=True)
+            query.edit_message_text("⚠️ خطایی در نمایش گزارش ذخیره شده رخ داد.")
+
+    def download_report(self, query) -> None:
+        """دانلود گزارش به صورت فایل"""
+        try:
+            domain = query.data.split(":")[1]
+            
+            # در اینجا می‌توانید گزارش را به فرمت مورد نظر (مثلاً CSV یا JSON) تبدیل کنید
+            # و به عنوان فایل ارسال کنید
+            
+            query.answer("این قابلیت در حال توسعه است.")
+            
+        except Exception as e:
+            logger.error(f"Error downloading report: {str(e)}", exc_info=True)
+            query.answer("⚠️ خطایی در تهیه فایل گزارش رخ داد.")
+
+    def save_report(self, query) -> None:
+        """ذخیره گزارش"""
+        try:
+            if not db or not query.from_user:
+                query.answer("⚠️ قابلیت ذخیره سازی فعال نیست.")
+                return
+
+            data = query.data.split(":")
+            report_type = data[0]
+            domain = data[1]
+            
+            if report_type == "save_report":
+                # ذخیره گزارش خلاصه
+                db.save_user_report(
+                    user_id=query.from_user.id,
+                    domain=domain,
+                    report_type="summary"
+                )
+                query.answer("✅ گزارش با موفقیت ذخیره شد.")
+            elif report_type == "save_full_report":
+                # ذخیره گزارش کامل
+                db.save_user_report(
+                    user_id=query.from_user.id,
+                    domain=domain,
+                    report_type="full"
+                )
+                query.answer("✅ گزارش کامل با موفقیت ذخیره شد.")
+            
+        except Exception as e:
+            logger.error(f"Error saving report: {str(e)}", exc_info=True)
+            query.answer("⚠️ خطایی در ذخیره گزارش رخ داد.")
+
+    def show_comparison_chart(self, query) -> None:
+        """نمایش نمودار مقایسه"""
+        try:
+            # در اینجا می‌توانید نمودار مقایسه را تولید و ارسال کنید
+            query.answer("این قابلیت در حال توسعه است.")
+            
+        except Exception as e:
+            logger.error(f"Error showing comparison chart: {str(e)}", exc_info=True)
+            query.answer("⚠️ خطایی در نمایش نمودار رخ داد.")
 
     def send_error_message(self, update: Update, action: str) -> None:
         """ارسال پیام خطای استاندارد"""
@@ -430,7 +574,8 @@ class BacklinkHandler:
 
             query.edit_message_text(
                 text="🔄 لطفا نوع تحلیل بک‌لینک را انتخاب کنید:",
-                reply_markup=InlineKeyboardMarkup(buttons)
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN
             )
 
         except Exception as e:
@@ -452,7 +597,7 @@ def setup_backlink_handlers(dispatcher) -> None:
     ))
     dispatcher.add_handler(CallbackQueryHandler(
         handler.handle_backlink_callback, 
-        pattern="^download_report:"
+        pattern="^download_"
     ))
     dispatcher.add_handler(CallbackQueryHandler(
         handler.handle_backlink_callback, 
@@ -461,6 +606,10 @@ def setup_backlink_handlers(dispatcher) -> None:
     dispatcher.add_handler(CallbackQueryHandler(
         handler.handle_backlink_callback, 
         pattern="^compare_chart:"
+    ))
+    dispatcher.add_handler(CallbackQueryHandler(
+        handler.handle_backlink_callback, 
+        pattern="^delete_report:"
     ))
     dispatcher.add_handler(MessageHandler(
         Filters.text & ~Filters.command,
